@@ -1,31 +1,64 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import classNames from 'classnames';
-import debounce from 'lodash/debounce';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Bullseye } from '@patternfly/react-core/dist/dynamic/layouts/Bullseye';
-import { Menu, MenuContent, MenuFooter, MenuGroup, MenuItem, MenuList } from '@patternfly/react-core/dist/dynamic/components/Menu';
+import { Menu, MenuContent, MenuGroup, MenuItem, MenuList } from '@patternfly/react-core/dist/dynamic/components/Menu';
 import { SearchInput as PFSearchInput, SearchInputProps } from '@patternfly/react-core/dist/dynamic/components/SearchInput';
 import { Spinner } from '@patternfly/react-core/dist/dynamic/components/Spinner';
 import { Popper } from '@patternfly/react-core/dist/dynamic/helpers/Popper/Popper';
 
-import './SearchInput.scss';
+import debounce from 'lodash/debounce';
+import uniq from 'lodash/uniq';
+import uniqWith from 'lodash/uniqWith';
 
+import './SearchInput.scss';
+import { AUTOSUGGEST_TERM_DELIMITER, SearchAutoSuggestionResponseType, SearchAutoSuggestionResultItem, SearchResponseType } from './SearchTypes';
 import EmptySearchState from './EmptySearchState';
+import { isProd } from '../../utils/common';
 import { useSegment } from '../../analytics/useSegment';
 import useWindowWidth from '../../hooks/useWindowWidth';
 import ChromeLink from '../ChromeLink';
 import SearchTitle from './SearchTitle';
 import SearchDescription from './SearchDescription';
-import { useAtomValue } from 'jotai';
-import { asyncLocalOrama } from '../../state/atoms/localSearchAtom';
-import { localQuery } from '../../utils/localSearch';
-import { isPreviewAtom } from '../../state/atoms/releaseAtom';
-import { ReleaseEnv } from '@redhat-cloud-services/types/index.js';
-import type { SearchItem } from './SearchTypes';
-import SearchFeedback, { SearchFeedbackType } from './SearchFeedback';
 
 export type SearchInputprops = {
   isExpanded?: boolean;
 };
+
+const IS_PROD = isProd();
+const REPLACE_TAG = 'REPLACE_TAG';
+const REPLACE_COUNT_TAG = 'REPLACE_COUNT_TAG';
+/**
+ * The ?q is the search term.
+ * ------
+ * The "~" after the search term enables fuzzy search (case sensitivity, similar results for typos).
+ * For example "inventry" query yields results with Inventory string within it.
+ * We can use distance ~(0-2) for example: "~2" to narrow restrict/expand the fuzzy search range
+ *
+ * Query parsin docs: https://solr.apache.org/guide/7_7/the-standard-query-parser.html#the-standard-query-parser
+ *
+ * hl=true enables string "highlight"
+ * hl.fl=field_name specifies field to be highlighted
+ */
+
+const BASE_SEARCH = new URLSearchParams();
+BASE_SEARCH.append('q', `alt_titles:${REPLACE_TAG}`); // add query replacement tag and enable fuzzy search with ~ and wildcards
+BASE_SEARCH.append('fq', 'documentKind:ModuleDefinition'); // search for ModuleDefinition documents
+BASE_SEARCH.append('rows', `${REPLACE_COUNT_TAG}`); // request 10 results
+
+const BASE_URL = new URL(`https://access.${IS_PROD ? '' : 'stage.'}redhat.com/hydra/rest/search/platform/console/`);
+// search API stopped receiving encoded search string
+BASE_URL.search = decodeURIComponent(BASE_SEARCH.toString());
+
+const SUGGEST_SEARCH = new URLSearchParams();
+SUGGEST_SEARCH.append('redhat_client', 'console'); // required client id
+SUGGEST_SEARCH.append('q', REPLACE_TAG); // add query replacement tag and enable fuzzy search with ~ and wildcards
+SUGGEST_SEARCH.append('suggest.count', '10'); // request 10 results
+SUGGEST_SEARCH.append('suggest.dictionary', 'improvedInfixSuggester'); // console  new suggest dictionary
+SUGGEST_SEARCH.append('suggest.dictionary', 'default');
+
+const SUGGEST_URL = new URL(`https://access.${IS_PROD ? '' : 'stage.'}redhat.com/hydra/proxy/gss-diag/rs/search/autosuggest`);
+// search API stopped receiving encoded search string
+SUGGEST_URL.search = decodeURIComponent(SUGGEST_SEARCH.toString());
+const SUGGEST_SEARCH_QUERY = SUGGEST_URL.toString();
 
 const getMaxMenuHeight = (menuElement?: HTMLDivElement | null) => {
   if (!menuElement) {
@@ -38,36 +71,40 @@ const getMaxMenuHeight = (menuElement?: HTMLDivElement | null) => {
   return bodyHeight - menuTopOffset - 4;
 };
 
+type SearchItem = {
+  title: string;
+  bundleTitle: string;
+  description: string;
+  pathname: string;
+};
+
 type SearchInputListener = {
   onStateChange: (isOpen: boolean) => void;
 };
 
+function parseSuggestions(suggestions: SearchAutoSuggestionResultItem[] = []) {
+  return suggestions.map((suggestion) => {
+    const [allTitle, bundleTitle, abstract] = suggestion.term.split(AUTOSUGGEST_TERM_DELIMITER);
+    const url = new URL(suggestion.payload);
+    return {
+      item: {
+        title: allTitle,
+        bundleTitle,
+        description: abstract,
+        pathname: url.pathname,
+      },
+      allTitle,
+    };
+  });
+}
+
 const SearchInput = ({ onStateChange }: SearchInputListener) => {
   const [isOpen, setIsOpen] = useState(false);
   const [searchValue, setSearchValue] = useState('');
-  const [currentFeedbackType, setcurrentFeedbackType] = useState<SearchFeedbackType>();
   const [isFetching, setIsFetching] = useState(false);
   const [searchItems, setSearchItems] = useState<SearchItem[]>([]);
-  const isPreview = useAtomValue(isPreviewAtom);
   const { ready, analytics } = useSegment();
   const blockCloseEvent = useRef(false);
-  const asyncLocalOramaData = useAtomValue(asyncLocalOrama);
-
-  const closeMenu = useCallback(() => {
-    setIsOpen(false);
-    onStateChange(false);
-  }, [onStateChange]);
-
-  const onResultKeyDown: React.KeyboardEventHandler = useCallback(
-    (e) => {
-      if (e.key === 'Enter') {
-        setTimeout(closeMenu);
-      }
-    },
-    [closeMenu]
-  );
-
-  const debouncedTrack = useCallback(analytics ? debounce(analytics.track, 1000) : () => null, [analytics]);
 
   const isMounted = useRef(false);
   const toggleRef = useRef<HTMLInputElement>(null);
@@ -76,25 +113,6 @@ const SearchInput = ({ onStateChange }: SearchInputListener) => {
   const { md } = useWindowWidth();
 
   const resultCount = searchItems.length;
-
-  const { internalItems, externalItems } = useMemo(() => {
-    const internalItems: SearchItem[] = [];
-    const externalItems: SearchItem[] = [];
-    searchItems.forEach((item) => {
-      if (item.isExternal) {
-        externalItems.push(item);
-      } else {
-        internalItems.push(item);
-      }
-    });
-    return { internalItems, externalItems };
-  }, [searchItems]);
-
-  useEffect(() => {
-    if (currentFeedbackType) {
-      setcurrentFeedbackType(undefined);
-    }
-  }, [searchValue]);
 
   const handleMenuKeys = (event: KeyboardEvent) => {
     if (!isOpen) {
@@ -141,9 +159,7 @@ const SearchInput = ({ onStateChange }: SearchInputListener) => {
 
     if (isOpen && ev.key === 'ArrowDown' && menuRef.current) {
       const firstElement = menuRef.current.querySelector('li > button:not(:disabled), li > a:not(:disabled)');
-      if (firstElement) {
-        (firstElement as HTMLElement).focus();
-      }
+      firstElement && (firstElement as HTMLElement).focus();
     } else if (isOpen && ev.key === 'Escape') {
       setIsOpen(false);
       onStateChange(false);
@@ -167,9 +183,10 @@ const SearchInput = ({ onStateChange }: SearchInputListener) => {
       window.removeEventListener('resize', handleWindowResize);
       isMounted.current = false;
     };
-  }, [isOpen, menuRef, resultCount]);
+  }, []);
 
   useEffect(() => {
+    handleWindowResize();
     window.addEventListener('keydown', handleMenuKeys);
     window.addEventListener('click', handleClickOutside);
     return () => {
@@ -178,17 +195,49 @@ const SearchInput = ({ onStateChange }: SearchInputListener) => {
     };
   }, [isOpen, menuRef]);
 
-  const handleChange: SearchInputProps['onChange'] = async (_e, value) => {
+  const handleFetch = async (value = '') => {
+    const response = (await fetch(SUGGEST_SEARCH_QUERY.replaceAll(REPLACE_TAG, value)).then((r) => r.json())) as SearchAutoSuggestionResponseType;
+
+    // parse default suggester
+    // parse improved suggester
+    let items: { item: SearchItem; allTitle: string }[] = [];
+    items = items
+      .concat(
+        parseSuggestions(response?.suggest?.default[value]?.suggestions),
+        parseSuggestions(response?.suggest?.improvedInfixSuggester[value]?.suggestions)
+      )
+      .slice(0, 10);
+    const suggests = uniq(items.map(({ allTitle }) => allTitle.replace(/(<b>|<\/b>)/gm, '').trim()));
+    let searchItems = items.map(({ item }) => item);
+    if (items.length < 10) {
+      const altTitleResults = (await fetch(
+        BASE_URL.toString()
+          .replaceAll(REPLACE_TAG, `(${suggests.length > 0 ? suggests.join(' OR ') + ' OR ' : ''}${value})`)
+          .replaceAll(REPLACE_COUNT_TAG, '10')
+      ).then((r) => r.json())) as { response: SearchResponseType };
+      searchItems = searchItems.concat(
+        altTitleResults.response.docs.map((doc) => ({
+          pathname: doc.relative_uri,
+          bundleTitle: doc.bundle_title[0],
+          title: doc.allTitle,
+          description: doc.abstract,
+        }))
+      );
+    }
+    searchItems = uniqWith(searchItems, (a, b) => a.title.replace(/(<b>|<\/b>)/gm, '').trim() === b.title.replace(/(<b>|<\/b>)/gm, '').trim());
+    setSearchItems(searchItems.slice(0, 10));
+    isMounted.current && setIsFetching(false);
+    if (ready && analytics) {
+      analytics.track('chrome.search-query', { query: value });
+    }
+  };
+
+  const debouncedFetch = useCallback(debounce(handleFetch, 500), []);
+
+  const handleChange: SearchInputProps['onChange'] = (_e, value) => {
     setSearchValue(value);
     setIsFetching(true);
-    const results = await localQuery(asyncLocalOramaData, value, isPreview ? ReleaseEnv.PREVIEW : ReleaseEnv.STABLE, 'services');
-    setSearchItems(results ?? []);
-    if (isMounted.current) {
-      setIsFetching(false);
-    }
-    if (ready && analytics) {
-      debouncedTrack('chrome.search-query', { query: value });
-    }
+    debouncedFetch(value);
   };
 
   const [isExpanded, setIsExpanded] = React.useState(false);
@@ -218,84 +267,64 @@ const SearchInput = ({ onStateChange }: SearchInputListener) => {
         setIsOpen(false);
         onStateChange(false);
       }}
-      {...{
+      {...(!md && {
         expandableInput: {
           isExpanded: willExpand(),
           onToggleExpand,
           toggleAriaLabel: 'Expandable search input toggle',
         },
-      }}
+      })}
       onClick={onInputClick}
       ref={toggleRef}
       onKeyDown={onToggleKeyDown}
-      className={classNames({
-        'pf-v6-u-flex-grow-1': isExpanded,
-        'pf-v6-u-justify-content-flex-end': !isExpanded,
-      })}
+      className={isExpanded ? 'pf-u-flex-grow-1' : 'chr-c-search__collapsed'}
     />
   );
-
-  let menuFooter;
-  if (searchItems.length > 0 && !isFetching) {
-    menuFooter = (
-      <MenuFooter className="pf-v6-u-px-md">
-        <SearchFeedback query={searchValue} results={searchItems} feedbackType={currentFeedbackType} onFeedbackSubmitted={setcurrentFeedbackType} />
-      </MenuFooter>
-    );
-  }
-
   const menu = (
-    <Menu ref={menuRef} className="pf-v6-u-pt-sm chr-c-search__menu">
+    <Menu ref={menuRef} className="pf-v5-u-pt-sm pf-v5-u-px-md chr-c-search__menu">
       <MenuContent>
         <MenuList>
           {isFetching ? (
-            <Bullseye className="pf-v6-u-p-md">
+            <Bullseye className="pf-v5-u-p-md">
               <Spinner size="xl" />
             </Bullseye>
           ) : (
             <>
-              {internalItems.length > 0 && (
-                <MenuGroup label={`Top ${internalItems.length} results`}>
-                  {internalItems.map((item) => (
-                    <MenuItem
-                      onKeyDown={onResultKeyDown}
-                      key={item.id}
-                      className="pf-v6-u-mb-xs"
-                      component={(props) => <ChromeLink {...props} href={item.pathname} />}
-                    >
-                      <SearchTitle title={item.title} bundleTitle={item.bundleTitle.replace(/(\[|\])/gm, '')} className="pf-v6-u-mb-xs" />
-                      <SearchDescription description={item.description} />
-                    </MenuItem>
-                  ))}
-                </MenuGroup>
-              )}
-              {externalItems.length > 0 && (
-                <MenuGroup label="External resources">
-                  {externalItems.map((item) => (
-                    <MenuItem
-                      onKeyDown={onResultKeyDown}
-                      key={item.id}
-                      className="pf-v6-u-mb-xs"
-                      component={(props) => <ChromeLink {...props} href={item.pathname} isExternal />}
-                    >
-                      <SearchTitle title={item.title} bundleTitle={item.bundleTitle.replace(/(\[|\])/gm, '')} className="pf-v6-u-mb-xs" isExternal />
-                      <SearchDescription description={item.description} />
-                    </MenuItem>
-                  ))}
-                </MenuGroup>
-              )}
+              <MenuGroup label={searchItems.length > 0 ? `Top ${searchItems.length} results` : undefined}>
+                {searchItems.map((item, index) => (
+                  <MenuItem
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        /**
+                         * Needs pushed to the end of the execution queue to not "swallow" the event
+                         * First the navigation event must execute and
+                         *  */
+                        setTimeout(() => {
+                          setIsOpen(false);
+                        });
+                      }
+                    }}
+                    key={index}
+                    className="pf-v5-u-mb-xs"
+                    component={(props) => <ChromeLink {...props} href={item.pathname} />}
+                  >
+                    <SearchTitle title={item.title} bundleTitle={item.bundleTitle.replace(/(\[|\])/gm, '')} />
+                    <SearchDescription description={item.description} />
+                  </MenuItem>
+                ))}
+              </MenuGroup>
             </>
           )}
           {searchItems.length === 0 && !isFetching && <EmptySearchState />}
         </MenuList>
       </MenuContent>
-      {menuFooter}
     </Menu>
   );
 
   return (
-    <div ref={containerRef} className="pf-v6-c-search-input pf-v6-u-w-100 pf-v6-u-align-content-center">
-      <Popper trigger={toggle} popper={menu} appendTo={containerRef.current || undefined} isVisible={isOpen} />
+    <div ref={containerRef} className="chr-c-search__input pf-v5-c-search-input pf-v5-u-w-100">
+      {!md && <Popper trigger={toggle} popper={menu} appendTo={containerRef.current || undefined} isVisible={isOpen} />}
+      {md && <Popper trigger={toggle} popper={menu} appendTo={containerRef.current || undefined} isVisible={isOpen} />}
     </div>
   );
 };

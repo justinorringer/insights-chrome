@@ -1,94 +1,21 @@
-import React, { Dispatch, SetStateAction } from 'react';
-
-import { useLoadModule, useRemoteHook } from '@scalprum/react-core';
-import { useFlag } from '@unleash/proxy-client-react';
-
-import { EmptyState, EmptyStateBody } from '@patternfly/react-core/dist/dynamic/components/EmptyState';
-import { Content } from '@patternfly/react-core/dist/dynamic/components/Content';
+import React from 'react';
+import { EmptyState, EmptyStateBody, EmptyStateIcon } from '@patternfly/react-core/dist/dynamic/components/EmptyState';
+import { Text, TextContent } from '@patternfly/react-core/dist/dynamic/components/Text';
 import { Title } from '@patternfly/react-core/dist/dynamic/components/Title';
+
 import SearchIcon from '@patternfly/react-icons/dist/dynamic/icons/search-icon';
 
-import './EmptySearchState.scss';
-
-export type ModelsType = {
-  VA: string;
-};
-
-type VirtualAssistantState = {
-  isOpen: boolean;
-  currentModel?: string;
-  message?: string;
-};
-
-const EmptySearchVALink = () => {
-  const { hookResult: useVirtualAssistant, loading } = useRemoteHook<[VirtualAssistantState, Dispatch<SetStateAction<VirtualAssistantState>>]>({
-    scope: 'virtualAssistant',
-    module: './state/globalState',
-    importName: 'useVirtualAssistant',
-  });
-  const [module] = useLoadModule(
-    {
-      scope: 'virtualAssistant',
-      module: './state/globalState',
-      importName: 'Models',
-    },
-    {}
-  );
-
-  const Models = module as ModelsType;
-  const [, setState] = useVirtualAssistant || [null, null];
-
-  return (
-    <Content component="p" className="pf-v6-u-text-color-subtle">
-      Try searching Hybrid Cloud help or start a conversation with our{' '}
-      <button
-        type="button"
-        onClick={() => {
-          if (setState) {
-            setState({
-              isOpen: true,
-              currentModel: Models.VA,
-              message: '',
-            });
-          }
-        }}
-        disabled={loading || !setState}
-        className="pf-v6-c-button pf-m-link pf-m-inline"
-      >
-        Virtual Assistant.
-      </button>
-    </Content>
-  );
-};
-
 const EmptySearchState = () => {
-  const isVAEnabled = useFlag('platform.va.environment.enabled');
-  const isChatbotTabEnabled = useFlag('platform.chrome.help-panel_chatbot');
-
   return (
-    <EmptyState
-      titleText={
-        <Title headingLevel="h2" size="lg" className="pf-v6-u-mb-sm">
-          No results found
-        </Title>
-      }
-      icon={SearchIcon}
-      className="chr-c-search__empty-state pf-v6-u-pt-md"
-      variant="xs"
-    >
+    <EmptyState className="chr-c-search__empty-state" variant="xs">
+      <EmptyStateIcon className="pf-v5-u-mb-xl" icon={SearchIcon} />
+      <Title headingLevel="h2" size="lg">
+        No results found
+      </Title>
       <EmptyStateBody>
-        <Content>
-          <Content component="p" className="pf-v6-u-text-color-subtle pf-v6-u-mb-0">
-            No results match your criteria.
-          </Content>
-          {isVAEnabled && !isChatbotTabEnabled ? (
-            <EmptySearchVALink />
-          ) : (
-            <Content component="p" className="pf-v6-u-text-color-subtle">
-              Try searching Hybrid Cloud help for more information.
-            </Content>
-          )}
-        </Content>
+        <TextContent>
+          <Text>No results match your criteria. Clear the search field and try again.</Text>
+        </TextContent>
       </EmptyStateBody>
     </EmptyState>
   );
